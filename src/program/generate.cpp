@@ -779,6 +779,10 @@ struct Options {
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
     int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
+    /// --control-vector-add-scaled: a second, additive table applied after the vector above (either mode), so a
+    /// projection and additive steering can run together.  None by default.
+    std::vector<std::pair<std::string, float>> cvec_add_files;
+    int cvec_add_first = -1, cvec_add_last = -1;   ///< default 1 .. the last layer
 };
 
 void usage() {
@@ -929,6 +933,9 @@ void usage() {
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
                  "  --cvec-mode add|project  h += s v (default) or h -= s (h.v) v with v unit\n"
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
+                 "  --control-vector-add-scaled FILE:SCALE[,...]  a second vector, always added (h += a), after the one\n"
+                 "                       above in either mode: a projection and additive steering together\n"
+                 "  --control-vector-add-layer-range A B  the layers the added vector follows (default 1 .. the last)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
@@ -1811,42 +1818,50 @@ private:
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
 // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports;
 // `digest` identifies the uploaded tables, mode and range exactly (a session file is bound to it).
+// --control-vector-add-scaled files are summed the same way into a second table that is always added after the
+// first (h <- h - s (h.v) v + a in project mode), on their own layer range.
 bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g, std::string& summary,
                           uint64_t& digest, std::string& err) {
     const int64_t L = g.n_layers, N = g.n_embd;
-    std::vector<float> data((size_t) (L * N), 0.0f);
-    std::vector<bool> have((size_t) L, false);
-    for (const auto& [path, scale] : o.cvec_files) {
-        try {
-            strata::GgufFile f(path);
-            const strata::MetaValue* arch = f.get("general.architecture");
-            if (arch == nullptr || arch->s != "controlvector") {
-                err = path + ": not a control vector GGUF (general.architecture is not 'controlvector')";
-                return false;
-            }
-            const strata::MetaValue* hint = f.get("controlvector.model_hint");
-            if (hint != nullptr && hint->s != "qwen4exp")
-                std::fprintf(stderr, "strata generate: %s was made for '%s', not qwen4exp\n", path.c_str(), hint->s.c_str());
-            int found = 0;
-            for (const strata::TensorInfo& t : f.tensors()) {
-                if (t.name.rfind("direction.", 0) != 0) continue;
-                const long l = std::strtol(t.name.c_str() + 10, nullptr, 10);
-                if (l < 1 || l >= L) continue;   // layer 0 has no vector; past the model is ignored, as in llama.cpp
-                if (t.type != 0 || t.elements() != (uint64_t) N) {
-                    err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
+    // every file's direction.<l> times its scale, summed into `data`; `have[l]`: some file had layer l
+    auto sum_files = [&](const std::vector<std::pair<std::string, float>>& files, std::vector<float>& data,
+                         std::vector<bool>& have) -> bool {
+        for (const auto& [path, scale] : files) {
+            try {
+                strata::GgufFile f(path);
+                const strata::MetaValue* arch = f.get("general.architecture");
+                if (arch == nullptr || arch->s != "controlvector") {
+                    err = path + ": not a control vector GGUF (general.architecture is not 'controlvector')";
                     return false;
                 }
-                const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
-                for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * src[j];
-                have[(size_t) l] = true;
-                ++found;
+                const strata::MetaValue* hint = f.get("controlvector.model_hint");
+                if (hint != nullptr && hint->s != "qwen4exp")
+                    std::fprintf(stderr, "strata generate: %s was made for '%s', not qwen4exp\n", path.c_str(), hint->s.c_str());
+                int found = 0;
+                for (const strata::TensorInfo& t : f.tensors()) {
+                    if (t.name.rfind("direction.", 0) != 0) continue;
+                    const long l = std::strtol(t.name.c_str() + 10, nullptr, 10);
+                    if (l < 1 || l >= L) continue;   // layer 0 has no vector; past the model is ignored, as in llama.cpp
+                    if (t.type != 0 || t.elements() != (uint64_t) N) {
+                        err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
+                        return false;
+                    }
+                    const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
+                    for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * src[j];
+                    have[(size_t) l] = true;
+                    ++found;
+                }
+                if (found == 0) { err = path + ": no direction.<layer> tensors"; return false; }
+            } catch (const std::exception& e) {
+                err = e.what();
+                return false;
             }
-            if (found == 0) { err = path + ": no direction.<layer> tensors"; return false; }
-        } catch (const std::exception& e) {
-            err = e.what();
-            return false;
         }
-    }
+        return true;
+    };
+    std::vector<float> data((size_t) (L * N), 0.0f);
+    std::vector<bool> have((size_t) L, false);
+    if (!sum_files(o.cvec_files, data, have)) return false;
     const int first = o.cvec_first <= 0 ? 1 : o.cvec_first;
     const int last = (o.cvec_last <= 0 || o.cvec_last >= L) ? (int) L - 1 : o.cvec_last;
     const int single = o.cvec_mode == 0 ? o.cvec_single : -1;
@@ -1873,8 +1888,35 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         }
         ++steered;
     }
-    if (steered == 0) { err = "the control vector has no direction in layers " + std::to_string(first) + ".." + std::to_string(last); return false; }
-    if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
+    if (!o.cvec_files.empty() && steered == 0) {
+        err = "the control vector has no direction in layers " + std::to_string(first) + ".." + std::to_string(last);
+        return false;
+    }
+    // the additive table: its own files and range, rows outside the range left zero
+    std::vector<float> add;
+    const int add_first = o.cvec_add_first <= 0 ? 1 : o.cvec_add_first;
+    const int add_last = (o.cvec_add_last <= 0 || o.cvec_add_last >= L) ? (int) L - 1 : o.cvec_add_last;
+    int added = 0;
+    if (!o.cvec_add_files.empty()) {
+        std::vector<float> add_data((size_t) (L * N), 0.0f);
+        std::vector<bool> add_have((size_t) L, false);
+        if (!sum_files(o.cvec_add_files, add_data, add_have)) return false;
+        add.assign((size_t) (L * N), 0.0f);
+        for (int64_t l = add_first; l <= add_last; ++l) {
+            if (!add_have[(size_t) l]) continue;
+            const float* a = add_data.data() + (size_t) (l * N);
+            if (std::none_of(a, a + N, [](float x) { return x != 0.0f; })) continue;
+            std::copy(a, a + N, add.begin() + (size_t) (l * N));
+            ++added;
+        }
+        if (added == 0) {
+            err = "the added control vector has no direction in layers " + std::to_string(add_first) + ".." +
+                  std::to_string(add_last);
+            return false;
+        }
+    }
+    if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err, add, add_first, add_last))
+        return false;
     {
         strata::core::SessionIdentityBuilder b(0x43564543ull);   // "CVEC"
         b.i64("mode", o.cvec_mode);
@@ -1883,14 +1925,24 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         b.i64("single", single);
         b.bytes("dir", dir.data(), dir.size() * sizeof(float));
         b.bytes("scale", s.data(), s.size() * sizeof(float));
+        if (added > 0) {   // only then: a config without an add table keeps its digest (and its saved sessions)
+            b.i64("add_first", add_first);
+            b.i64("add_last", add_last);
+            b.bytes("add", add.data(), add.size() * sizeof(float));
+        }
         digest = b.digest();
         if (digest == 0) digest = 1;   // 0 means "none loaded"
     }
-    summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
-              (single >= 0 ? ":single" + std::to_string(single) : "");
+    summary = o.cvec_files.empty() ? std::string("none")
+                                   : std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) +
+                                         "-" + std::to_string(last) + (single >= 0 ? ":single" + std::to_string(single) : "");
+    if (added > 0) summary += "+add:" + std::to_string(add_first) + "-" + std::to_string(add_last);
     // the line llama.cpp's patched build prints, so a log shows the same thing
-    std::fprintf(stderr, "strata generate: control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n",
-                 o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
+    if (!o.cvec_files.empty())
+        std::fprintf(stderr, "strata generate: control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n",
+                     o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
+    if (added > 0)
+        std::fprintf(stderr, "strata generate: added control vector, layers %d..%d (%d added)\n", add_first, add_last, added);
     return true;
 }
 
@@ -2545,24 +2597,29 @@ int main(int argc, char** argv) {
         }
         else if (a == "--mtp-draft-vocab") o.mtp_draft_vocab = next("--mtp-draft-vocab");
         else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
-        else if (a == "--control-vector-scaled") {
+        else if (a == "--control-vector-scaled" || a == "--control-vector-add-scaled") {
             // FILE:SCALE, comma-separated; the LAST colon splits, so a Windows path (C:\...) keeps its drive
-            std::stringstream list(next("--control-vector-scaled"));
+            auto& into = a == "--control-vector-scaled" ? o.cvec_files : o.cvec_add_files;
+            std::stringstream list(next(a.c_str()));
             std::string item;
             while (std::getline(list, item, ',')) {
                 const size_t colon = item.rfind(':');
                 char* end = nullptr;
                 const float sc = colon == std::string::npos ? 0.0f : std::strtof(item.c_str() + colon + 1, &end);
                 if (colon == std::string::npos || colon == 0 || end == item.c_str() + colon + 1 || *end != '\0') {
-                    std::fprintf(stderr, "--control-vector-scaled: expected FILE:SCALE, got '%s'\n", item.c_str());
+                    std::fprintf(stderr, "%s: expected FILE:SCALE, got '%s'\n", a.c_str(), item.c_str());
                     return 2;
                 }
-                o.cvec_files.push_back({item.substr(0, colon), sc});
+                into.push_back({item.substr(0, colon), sc});
             }
         }
         else if (a == "--control-vector-layer-range") {
             o.cvec_first = std::atoi(next("--control-vector-layer-range"));
             o.cvec_last = std::atoi(next("--control-vector-layer-range"));
+        }
+        else if (a == "--control-vector-add-layer-range") {
+            o.cvec_add_first = std::atoi(next("--control-vector-add-layer-range"));
+            o.cvec_add_last = std::atoi(next("--control-vector-add-layer-range"));
         }
         else if (a == "--cvec-mode") {
             const std::string m = next("--cvec-mode");
@@ -3708,7 +3765,7 @@ int main(int argc, char** argv) {
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
     uint64_t cvec_digest = 0;   // a session file is bound to the loaded vector (0: none)
-    if (!o.cvec_files.empty()) {
+    if (!o.cvec_files.empty() || !o.cvec_add_files.empty()) {
         std::string ce;
         if (!load_control_vectors(o, g, cvec_summary, cvec_digest, ce)) {
             std::fprintf(stderr, "strata generate: control vector: %s\n", ce.c_str());

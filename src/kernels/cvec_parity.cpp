@@ -4,6 +4,7 @@
 //   3. switched off: R unchanged without a pending write; with one, R is BITWISE the write the fused read folds
 //      (fused_gr_read with apply), which is what keeps a loaded-but-off vector identical to the stock engine.
 //   4. a layer without a direction is untouched.
+//   5. both tables (--control-vector-add-scaled with a projection): h - (h.v) v + a, add-only layers, one switch.
 
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/fused_gr.hpp"
@@ -216,6 +217,79 @@ int main() {
                     same = same && got[i] == R[i] + dir[(size_t) (kLayer * N + j)];
                 }
         check(same, "add is h + d in every stream (bitwise)");
+    }
+
+    // ---- 5. both tables: a projection (layers 4..44) and an added vector (layers 2..20) at once
+    //      kLayer (7) gets h - (h.v) v + a; kOff (3) is add-only: h + a; 45 is outside both: untouched
+    std::printf("project + add\n");
+    {
+        constexpr int64_t kOut = 45;
+        std::vector<float> pdir((size_t) (L * N), 0.0f), ps((size_t) L, 0.0f), add((size_t) (L * N), 0.0f);
+        double nrm = 0.0;
+        for (int64_t j = 0; j < N; ++j) { pdir[(size_t) (kLayer * N + j)] = nd(rng); nrm += (double) pdir[(size_t) (kLayer * N + j)] * pdir[(size_t) (kLayer * N + j)]; }
+        nrm = std::sqrt(nrm);
+        for (int64_t j = 0; j < N; ++j) pdir[(size_t) (kLayer * N + j)] = (float) (pdir[(size_t) (kLayer * N + j)] / nrm);
+        ps[(size_t) kLayer] = 1.0f;
+        for (int64_t l : {kOff, kLayer, kOut})
+            for (int64_t j = 0; j < N; ++j) add[(size_t) (l * N + j)] = 0.05f * nd(rng);   // kOut's row lies outside 2..20
+        k::cvec_set_enabled(true);
+        if (!k::cvec_upload(pdir, ps, /*project*/ 0, 4, 44, N, HC, err, add, 2, 20)) { std::fprintf(stderr, "%s\n", err.c_str()); return 2; }
+        const auto& cv = k::cvec();
+        check(cv.covers(kLayer) && cv.adds(kLayer), "covers()/adds(): the projected layer also adds");
+        check(cv.covers(kOff) && cv.adds(kOff), "covers()/adds(): an add-only layer is covered");
+        check(!cv.covers(kOut) && !cv.adds(kOut), "a layer outside both ranges is not covered");
+
+        up(dR, R);
+        k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
+        ck(cudaDeviceSynchronize(), "project+add");
+        {
+            const auto got = down(dR, R.size());
+            double worst = 0.0, worst_dot = 0.0;
+            const float* v = pdir.data() + kLayer * N;
+            const float* a = add.data() + kLayer * N;
+            double av = 0.0;
+            for (int64_t j = 0; j < N; ++j) av += (double) a[j] * v[j];
+            for (int64_t t = 0; t < T; ++t)
+                for (int64_t c = 0; c < HC; ++c) {
+                    const float* h = R.data() + t * D + c * N;
+                    double dot = 0.0;
+                    for (int64_t j = 0; j < N; ++j) dot += (double) h[j] * v[j];
+                    double after = 0.0;
+                    for (int64_t j = 0; j < N; ++j) {
+                        const double g = got[(size_t) (t * D + c * N + j)];
+                        worst = std::fmax(worst, std::fabs(g - (h[j] - dot * v[j] + a[j])));
+                        after += g * v[j];
+                    }
+                    // projected out first, so what's left along v is only the added vector's own component
+                    worst_dot = std::fmax(worst_dot, std::fabs(after - av));
+                }
+            std::printf("    max |err| %.3g, max |h'.v - a.v| %.3g\n", worst, worst_dot);
+            check(worst < 1e-4, "project then add: h - (h.v) v + a");
+            check(worst_dot < 1e-3, "the projected direction holds only a's component (order is project, then add)");
+        }
+
+        up(dR, R);
+        k::cvec_apply(dR, kOff, T, D, nullptr, 0, nullptr, 0, false, nullptr);
+        ck(cudaDeviceSynchronize(), "add-only");
+        {
+            const auto got = down(dR, R.size());
+            double worst = 0.0;
+            for (int64_t t = 0; t < T; ++t)
+                for (int64_t c = 0; c < HC; ++c)
+                    for (int64_t j = 0; j < N; ++j) {
+                        const size_t i = (size_t) (t * D + c * N + j);
+                        worst = std::fmax(worst, std::fabs((double) got[i] - ((double) R[i] + add[(size_t) (kOff * N + j)])));
+                    }
+            check(worst < 1e-6, "add-only layer: h + a");
+        }
+
+        k::cvec_set_enabled(false);
+        up(dR, R);
+        k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
+        ck(cudaDeviceSynchronize(), "both off");
+        check(std::memcmp(down(dR, R.size()).data(), R.data(), R.size() * 4) == 0,
+              "switched off: neither table touches R (one switch for both)");
+        k::cvec_set_enabled(true);
     }
 
     std::printf(g_fail ? "cvec_parity: %d FAILED\n" : "cvec_parity: all passed\n", g_fail);

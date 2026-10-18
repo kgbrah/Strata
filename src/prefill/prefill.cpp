@@ -4508,11 +4508,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // control vector)
                 const int64_t nl = half == 0 ? l : l + 1;
                 const bool steered = half == 1 && strata::kernels::cvec().covers(l);
-                const float *cv_dir = nullptr, *cv_s = nullptr;
+                const float *cv_dir = nullptr, *cv_s = nullptr, *cv_add = nullptr;
                 const int* cv_on = nullptr;
                 const bool cv_fused = steered && cvec_fuse() && !gr_unfused() && nl < LE && !(nl == 1 && ple_on) &&
                                       strata::kernels::cvec().n_embd == N && strata::kernels::cvec().hc == HC &&
-                                      strata::kernels::cvec_tables(&cv_dir, &cv_s, &cv_on);
+                                      strata::kernels::cvec_tables(&cv_dir, &cv_s, &cv_on, &cv_add);
+                // the add table's row for this layer (--control-vector-add-scaled), or nullptr
+                const float* cv_a =
+                    cv_fused && cv_add != nullptr && strata::kernels::cvec().adds(l) ? cv_add + l * N : nullptr;
                 const bool fuse = !gr_unfused() && nl < LE && !(half == 1 && nl == 1 && ple_on) && (!steered || cv_fused);
                 const core::WeightRef* wnn = nullptr;
                 if (fuse) {
@@ -4535,7 +4538,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         strata::kernels::cvec_apply(Rc, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
                         gr_norm_rs(Rc, (const float*) wnn->data, EPS, rc, xc, T, m.cs, nullptr, D, xf16);
                         gr_write_cvec_norm_rs(m.R, m.bo, m.inj, HC, cv_dir + l * N, cv_s + l, cv_on,
-                                              strata::kernels::cvec().mode, (const float*) wnn->data, EPS, m.grs,
+                                              strata::kernels::cvec().mode, cv_a, (const float*) wnn->data, EPS, m.grs,
                                               m.xn16, T, m.cs, m.xn16_lo, ldx, xf16);
                         std::vector<float> a((size_t) T * D), b((size_t) T * D), ra((size_t) T * HC), rb((size_t) T * HC);
                         std::vector<uint16_t> xa((size_t) T * D), xb((size_t) T * D);
@@ -4554,7 +4557,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                      std::memcmp(xa.data(), xb.data(), xa.size() * 2) ? "DIFFERS" : "identical");
                     } else
                     gr_write_cvec_norm_rs(m.R, m.bo, m.inj, HC, cv_dir + l * N, cv_s + l, cv_on,
-                                          strata::kernels::cvec().mode, (const float*) wnn->data, EPS, m.grs, m.xn16,
+                                          strata::kernels::cvec().mode, cv_a, (const float*) wnn->data, EPS, m.grs, m.xn16,
                                           T, m.cs, m.xn16_lo, ldx, xf16);
                     normed = true;
                 } else if (wnn) {
